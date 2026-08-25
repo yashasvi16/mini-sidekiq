@@ -1,0 +1,12 @@
+# Binaries
+/bin/
+*.exe
+*.test
+
+# IDE
+.vscode/
+.idea/
+
+# Env files (you'll add secrets here in later phases — never commit these)
+.env
+*.env.local
