@@ -102,3 +102,64 @@ func (b *redisBroker) Dequeue(ctx context.Context, queues []string) (*sidekiq.Jo
 
 	return &job, nil
 }
+
+func (b *redisBroker) Acknowledge(ctx context.Context, job *sidekiq.Job) error {
+	if err := b.client.ZRem(ctx, "sidekiq:active", job.ID).Err(); err != nil {
+		return fmt.Errorf("remove from active: %w", err)
+	}
+
+	jobKey := fmt.Sprintf("sidekiq:job:%s", job.ID)
+	if err := b.client.Del(ctx, jobKey).Err(); err != nil {
+		return fmt.Errorf("delete job key: %w", err)
+	}
+
+	return nil
+}
+
+func (b *redisBroker) Requeue(ctx context.Context, job *sidekiq.Job, delay time.Duration) error {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("job data marshal: %w", err)
+	}
+	jobKey := fmt.Sprintf("sidekiq:job:%s", job.ID)
+	if err := b.client.Set(ctx, jobKey, data, 0).Err(); err != nil {
+		return fmt.Errorf("set job and data: %w", err)
+	}
+
+	retryKey := fmt.Sprintf("sidekiq:retry:%s", job.Queue)
+	if err := b.client.ZAdd(ctx, retryKey, redis.Z{
+		Score:  float64(time.Now().Add(delay).Unix()),
+		Member: job.ID,
+	}).Err(); err != nil {
+		return fmt.Errorf("add in retry queue: %w", err)
+	}
+
+	if err := b.client.ZRem(ctx, "sidekiq:active", job.ID).Err(); err != nil {
+		return fmt.Errorf("remove from active: %w", err)
+	}
+
+	return nil
+}
+
+func (b *redisBroker) MoveToDeadLetter(ctx context.Context, job *sidekiq.Job) error {
+	job.Status = sidekiq.StatusDead
+	data, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("job data marshal: %w", err)
+	}
+	jobKey := fmt.Sprintf("sidekiq:job:%s", job.ID)
+	if err := b.client.Set(ctx, jobKey, data, 0).Err(); err != nil {
+		return fmt.Errorf("set job and data: %w", err)
+	}
+
+	deadKey := fmt.Sprintf("sidekiq:dead:%s", job.Queue)
+	if err := b.client.LPush(ctx, deadKey, job.ID).Err(); err != nil {
+		return fmt.Errorf("push in dead queue: %w", err)
+	}
+
+	if err := b.client.ZRem(ctx, "sidekiq:active", job.ID).Err(); err != nil {
+		return fmt.Errorf("remove from active: %w", err)
+	}
+
+	return nil
+}
