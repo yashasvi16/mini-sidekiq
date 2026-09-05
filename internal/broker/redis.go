@@ -24,6 +24,41 @@ redis.call('ZADD', KEYS[2], ARGV[1], id)
 return id
 `)
 
+var setBranchLpushZaddScript = redis.NewScript(`
+redis.call('SET', KEYS[1], ARGV[1])
+
+local processAt = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+if processAt <= now then
+    redis.call('LPUSH', KEYS[2], ARGV[5])
+else
+    redis.call('ZADD', KEYS[3], processAt, ARGV[5])
+end
+return 1
+`)
+
+var setZaddZremScript = redis.NewScript(`
+redis.call('SET', KEYS[1], ARGV[1])
+
+local processAt = tonumber(ARGV[2])
+redis.call('ZADD', KEYS[2], processAt, ARGV[3])
+
+redis.call('ZREM', KEYS[3], ARGV[3])
+
+return 1
+`)
+
+var setLpushZremScript = redis.NewScript(`
+redis.call('SET', KEYS[1], ARGV[1])
+
+redis.call('LPUSH', KEYS[2], ARGV[2])
+
+redis.call('ZREM', KEYS[3], ARGV[2])
+
+return 1
+`)
+
 func NewRedisBroker(addr string) *redisBroker {
 	client := redis.NewClient(&redis.Options{
 		Addr: addr,
@@ -38,28 +73,22 @@ func (b *redisBroker) Enqueue(ctx context.Context, job *sidekiq.Job) error {
 	}
 
 	jobKey := fmt.Sprintf("sidekiq:job:%s", job.ID)
-	if err := b.client.Set(ctx, jobKey, data, 0).Err(); err != nil {
-		return fmt.Errorf("store job data: %w", err)
-	}
-
+	queueKey := fmt.Sprintf("sidekiq:queue:%s", job.Queue)
 	now := time.Now()
-	if !job.ProcessAt.After(now) {
-		queueKey := fmt.Sprintf("sidekiq:queue:%s", job.Queue)
-		if err := b.client.LPush(ctx, queueKey, job.ID).Err(); err != nil {
-			return fmt.Errorf("push to queue: %w", err)
-		}
-	} else {
-		err := b.client.ZAdd(ctx, "sidekiq:scheduled", redis.Z{Score: float64(job.ProcessAt.Unix()), Member: job.ID}).Err()
-		if err != nil {
-			return fmt.Errorf("add to scheduled: %w", err)
-		}
-	}
+	_, err = setBranchLpushZaddScript.Run(
+		ctx,
+		b.client,
+		[]string{jobKey, queueKey, "sidekiq:scheduled"},
+		data,
+		job.ProcessAt.Unix(),
+		now.Unix(),
+		job.Queue,
+		job.ID,
+	).Result()
 
-	// TODO: not atomic — job data write and queue push are two separate
-	// round trips. If the process crashes between them, sidekiq:job:{id}
-	// exists but nothing points to it, so it's never processed. Revisit
-	// with a Lua script or MULTI/EXEC once retry/dead-letter (Phase 5)
-	// forces the same question there too.
+	if err != nil {
+		return fmt.Errorf("atomic enqueu: %w", err)
+	}
 
 	return nil
 }
@@ -121,21 +150,20 @@ func (b *redisBroker) Requeue(ctx context.Context, job *sidekiq.Job, delay time.
 	if err != nil {
 		return fmt.Errorf("job data marshal: %w", err)
 	}
+
 	jobKey := fmt.Sprintf("sidekiq:job:%s", job.ID)
-	if err := b.client.Set(ctx, jobKey, data, 0).Err(); err != nil {
-		return fmt.Errorf("set job and data: %w", err)
-	}
-
 	retryKey := fmt.Sprintf("sidekiq:retry:%s", job.Queue)
-	if err := b.client.ZAdd(ctx, retryKey, redis.Z{
-		Score:  float64(time.Now().Add(delay).Unix()),
-		Member: job.ID,
-	}).Err(); err != nil {
-		return fmt.Errorf("add in retry queue: %w", err)
-	}
+	_, err = setZaddZremScript.Run(
+		ctx,
+		b.client,
+		[]string{jobKey, retryKey, "sidekiq:active"},
+		data,
+		time.Now().Add(delay).Unix(),
+		job.ID,
+	).Result()
 
-	if err := b.client.ZRem(ctx, "sidekiq:active", job.ID).Err(); err != nil {
-		return fmt.Errorf("remove from active: %w", err)
+	if err != nil {
+		return fmt.Errorf("atomic requeue: %w", err)
 	}
 
 	return nil
@@ -147,18 +175,19 @@ func (b *redisBroker) MoveToDeadLetter(ctx context.Context, job *sidekiq.Job) er
 	if err != nil {
 		return fmt.Errorf("job data marshal: %w", err)
 	}
+
 	jobKey := fmt.Sprintf("sidekiq:job:%s", job.ID)
-	if err := b.client.Set(ctx, jobKey, data, 0).Err(); err != nil {
-		return fmt.Errorf("set job and data: %w", err)
-	}
-
 	deadKey := fmt.Sprintf("sidekiq:dead:%s", job.Queue)
-	if err := b.client.LPush(ctx, deadKey, job.ID).Err(); err != nil {
-		return fmt.Errorf("push in dead queue: %w", err)
-	}
+	_, err = setLpushZremScript.Run(
+		ctx,
+		b.client,
+		[]string{jobKey, deadKey, "sidekiq:active"},
+		data,
+		job.ID,
+	).Result()
 
-	if err := b.client.ZRem(ctx, "sidekiq:active", job.ID).Err(); err != nil {
-		return fmt.Errorf("remove from active: %w", err)
+	if err != nil {
+		return fmt.Errorf("atomic move to dead letter: %w", err)
 	}
 
 	return nil
