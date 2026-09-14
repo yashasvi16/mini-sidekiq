@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -46,6 +47,7 @@ func main() {
 	})
 
 	server.Register("SendEmail", sendEmailHandler(logger))
+	server.Register("FailingJob", failingJobHandler(logger))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -63,5 +65,16 @@ func sendEmailHandler(logger *slog.Logger) client.Handler {
 		logger.Info("sending email", "job_id", job.ID, "payload", string(job.Payload))
 		time.Sleep(200 * time.Millisecond) // simulate work
 		return nil
+	}
+}
+
+// failingJobHandler always fails - a deliberate way to exercise retry
+// backoff and the dead-letter path by hand: enqueue a job of this type
+// (e.g. `go run ./cmd/enqueue -type FailingJob -max-attempts 2`) and watch
+// it retry, then land in the dashboard's dead-jobs list.
+func failingJobHandler(logger *slog.Logger) client.Handler {
+	return func(ctx context.Context, job *sidekiq.Job) error {
+		logger.Info("failing job on purpose", "job_id", job.ID, "attempt", job.Attempts+1)
+		return fmt.Errorf("simulated failure (attempt %d)", job.Attempts+1)
 	}
 }

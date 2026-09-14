@@ -26,8 +26,9 @@ type Config struct {
 
 // EnqueueOptions customizes how a single job is enqueued.
 type EnqueueOptions struct {
-	Queue string        // defaults to "default"
-	In    time.Duration // delay before the job becomes eligible to run
+	Queue       string        // defaults to "default"
+	In          time.Duration // delay before the job becomes eligible to run
+	MaxAttempts int           // defaults to 3 (sidekiq.NewJob's default) if zero
 }
 
 // Client enqueues jobs onto the broker for workers to process.
@@ -49,11 +50,13 @@ func NewClient(cfg Config) *Client {
 func (c *Client) Enqueue(ctx context.Context, jobType string, payload any, opts ...EnqueueOptions) (*sidekiq.Job, error) {
 	queue := "default"
 	var delay time.Duration
+	var maxAttempts int
 	if len(opts) > 0 {
 		if opts[0].Queue != "" {
 			queue = opts[0].Queue
 		}
 		delay = opts[0].In
+		maxAttempts = opts[0].MaxAttempts
 	}
 
 	job, err := sidekiq.NewJob(queue, jobType, payload)
@@ -62,6 +65,9 @@ func (c *Client) Enqueue(ctx context.Context, jobType string, payload any, opts 
 	}
 	if delay > 0 {
 		job.ProcessAt = time.Now().Add(delay)
+	}
+	if maxAttempts > 0 {
+		job.MaxAttempts = maxAttempts
 	}
 
 	if err := c.broker.Enqueue(ctx, job); err != nil {
