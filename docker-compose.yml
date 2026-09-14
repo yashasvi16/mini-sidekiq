@@ -3,3 +3,17 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sidekiq
+      POSTGRES_PASSWORD: sidekiq
+      POSTGRES_DB: sidekiq
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sidekiq"]
+      interval: 2s
+      timeout: 3s
+      retries: 10

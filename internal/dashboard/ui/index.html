@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini-Sidekiq Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --border: #262b3a;
+    --text: #e4e7ee;
+    --muted: #8b90a3;
+    --accent: #5b8cff;
+    --danger: #ff5b6b;
+    --ok: #3ecf8e;
+    --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  section { margin-bottom: 32px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #1d2130; cursor: pointer; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .badge-dead { background: rgba(255,91,107,0.15); color: var(--danger); }
+  .badge-retry { background: rgba(255,180,84,0.15); color: var(--warn); }
+  .badge-pending { background: rgba(91,140,255,0.15); color: var(--accent); }
+  .badge-active { background: rgba(62,207,142,0.15); color: var(--ok); }
+  .badge-completed { background: rgba(139,144,163,0.15); color: var(--muted); }
+  select, button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .toolbar .spacer { flex: 1; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+  .actions button { margin-right: 6px; font-size: 12px; padding: 4px 8px; }
+  code { background: #1d2130; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 10; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; width: 560px; max-width: 90vw; max-height: 80vh; overflow: auto; }
+  .modal h3 { margin: 0 0 12px; font-size: 14px; }
+  .modal pre { background: #0f1117; padding: 12px; border-radius: 6px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .modal .row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .modal .close { float: right; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Mini-Sidekiq</h1>
+    <div class="sub">job queue dashboard</div>
+  </div>
+  <div class="sub" id="lastUpdated">-</div>
+</header>
+
+<main>
+  <section>
+    <h2>Queues</h2>
+    <table id="queueTable">
+      <thead><tr><th>Queue</th><th>Pending</th><th>Scheduled</th><th>Retry</th><th>Active</th><th>Dead</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Jobs</h2>
+    <div class="toolbar">
+      <select id="statusFilter">
+        <option value="pending">Pending</option>
+        <option value="active">Active</option>
+        <option value="retry">Retry</option>
+        <option value="dead" selected>Dead</option>
+        <option value="completed">Completed</option>
+      </select>
+      <span class="spacer"></span>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+    <table id="jobTable">
+      <thead><tr><th>ID</th><th>Type</th><th>Queue</th><th>Attempts</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<div id="modalRoot"></div>
+
+<script>
+const statusFilter = document.getElementById('statusFilter');
+const refreshBtn = document.getElementById('refreshBtn');
+const lastUpdated = document.getElementById('lastUpdated');
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || res.statusText);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+function badge(status) {
+  return `<span class="badge badge-${status}">${status}</span>`;
+}
+
+async function loadQueues() {
+  const stats = await fetchJSON('/api/v1/queues').catch(() => ({}));
+  const tbody = document.querySelector('#queueTable tbody');
+  const rows = Object.values(stats || {});
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No queues yet - enqueue a job to see it here.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(q => `
+    <tr>
+      <td>${q.queue}</td>
+      <td>${q.enqueued || 0}</td>
+      <td>${q.scheduled || 0}</td>
+      <td>${q.retry || 0}</td>
+      <td>${q.active || 0}</td>
+      <td>${q.dead || 0}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadJobs() {
+  const status = statusFilter.value;
+  const jobs = await fetchJSON(`/api/v1/jobs?status=${status}&limit=100`).catch(() => []);
+  const tbody = document.querySelector('#jobTable tbody');
+  if (!jobs || jobs.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">No ${status} jobs.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = jobs.map(j => `
+    <tr data-id="${j.id}">
+      <td><code>${j.id.slice(0, 8)}</code></td>
+      <td>${j.type}</td>
+      <td>${j.queue}</td>
+      <td>${j.attempts}/${j.max_attempts}</td>
+      <td>${badge(j.status)}</td>
+      <td class="actions">
+        ${j.status === 'dead' ? `<button class="primary" data-action="retry" data-id="${j.id}">Retry</button>` : ''}
+        <button class="danger" data-action="delete" data-id="${j.id}">Delete</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function closeModal() {
+  document.getElementById('modalRoot').innerHTML = '';
+}
+
+async function showJobDetail(id) {
+  const job = await fetchJSON(`/api/v1/jobs/${id}`).catch(e => { alert(e.message); return null; });
+  if (!job) return;
+  document.getElementById('modalRoot').innerHTML = `
+    <div class="modal-backdrop" id="backdrop">
+      <div class="modal">
+        <button class="close" data-action="close">&times;</button>
+        <h3>Job ${job.id}</h3>
+        <div class="row"><span>Type</span><span>${job.type}</span></div>
+        <div class="row"><span>Queue</span><span>${job.queue}</span></div>
+        <div class="row"><span>Status</span><span>${badge(job.status)}</span></div>
+        <div class="row"><span>Attempts</span><span>${job.attempts}/${job.max_attempts}</span></div>
+        <div class="row"><span>Created</span><span>${job.created_at}</span></div>
+        <div class="row"><span>Process At</span><span>${job.process_at}</span></div>
+        ${job.last_error ? `<p><strong>Last error</strong></p><pre>${job.last_error}</pre>` : ''}
+        <p><strong>Payload</strong></p>
+        <pre>${JSON.stringify(job.payload ?? null, null, 2)}</pre>
+      </div>
+    </div>
+  `;
+}
+
+async function refresh() {
+  await Promise.all([loadQueues(), loadJobs()]);
+  lastUpdated.textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+document.querySelector('#jobTable tbody').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (btn) {
+    e.stopPropagation();
+    const id = btn.dataset.id;
+    if (btn.dataset.action === 'retry') {
+      await fetchJSON(`/api/v1/jobs/${id}/retry`, { method: 'POST' }).catch(err => alert(err.message));
+    } else if (btn.dataset.action === 'delete') {
+      if (!confirm('Delete this job permanently?')) return;
+      await fetchJSON(`/api/v1/jobs/${id}`, { method: 'DELETE' }).catch(err => alert(err.message));
+    }
+    refresh();
+    return;
+  }
+  const row = e.target.closest('tr[data-id]');
+  if (row) showJobDetail(row.dataset.id);
+});
+
+document.getElementById('modalRoot').addEventListener('click', (e) => {
+  if (e.target.id === 'backdrop' || e.target.dataset.action === 'close') closeModal();
+});
+
+statusFilter.addEventListener('change', loadJobs);
+refreshBtn.addEventListener('click', refresh);
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

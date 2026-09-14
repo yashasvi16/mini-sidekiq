@@ -1,0 +1,11 @@
+# Copy to config.yaml and adjust as needed, or leave everything to defaults
+# and environment variables (SIDEKIQ_REDIS_ADDR, SIDEKIQ_CONCURRENCY, etc).
+redis_addr: "localhost:6379"
+dashboard_addr: ":8080"
+concurrency: 10
+poll_interval: "250ms"
+scheduler_interval: "5s"
+queues:
+  critical: 3
+  default: 2
+  low: 1
